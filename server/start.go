@@ -3,6 +3,8 @@ package server
 // DONTCOVER
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,14 +12,19 @@ import (
 	"os"
 	"runtime/pprof"
 	"time"
+	"net/url"
 
+	"github.com/ethereum/go-ethereum/rpc"
+	dbm "github.com/cometbft/cometbft-db"
 	"github.com/cometbft/cometbft/abci/server"
+	abci "github.com/cometbft/cometbft/abci/types"
 	tcmd "github.com/cometbft/cometbft/cmd/cometbft/commands"
-	"github.com/cometbft/cometbft/node"
-	"github.com/cometbft/cometbft/p2p"
-	pvm "github.com/cometbft/cometbft/privval"
-	"github.com/cometbft/cometbft/proxy"
-	"github.com/cometbft/cometbft/rpc/client/local"
+	e2eurl "github.com/polymerdao/monomer/e2e/url"
+	"github.com/cosmos/cosmos-sdk/store"
+	"github.com/polymerdao/monomer/genesis"
+	"github.com/polymerdao/monomer/node"
+	"github.com/polymerdao/monomer/environment"
+	rolluptypes "github.com/polymerdao/monomer/x/rollup/types"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -263,6 +270,15 @@ func startStandAlone(ctx *Context, appCreator types.AppCreator) error {
 	return WaitForQuitSignals()
 }
 
+type monomerApp struct {
+	abci.Application
+	cms store.CommitMultiStore
+}
+
+func (app *monomerApp) RollbackToHeight(targetHeight uint64) error {
+	return app.cms.RollbackToVersion(int64(targetHeight))
+}
+
 func startInProcess(ctx *Context, clientCtx client.Context, appCreator types.AppCreator) error {
 	cfg := ctx.Config
 	home := cfg.RootDir
@@ -300,39 +316,108 @@ func startInProcess(ctx *Context, clientCtx client.Context, appCreator types.App
 
 	app := appCreator(ctx.Logger, db, traceWriter, ctx.Viper)
 
-	nodeKey, err := p2p.LoadOrGenNodeKey(cfg.NodeKeyFile())
-	if err != nil {
-		return err
-	}
-	genDocProvider := node.DefaultGenesisDocProviderFunc(cfg)
-
 	var (
 		tmNode   *node.Node
 		gRPCOnly = ctx.Viper.GetBool(flagGRPCOnly)
 	)
 
+	genesisPath := ctx.Viper.GetString("monomer.genesis")
+	genesisBytes, err := os.ReadFile(genesisPath)
+	if err != nil {
+		return fmt.Errorf("read genesis file: %v", err)
+	}
+	nodeGenesis := new(genesis.Genesis)
+	if err := json.Unmarshal(genesisBytes, &nodeGenesis); err != nil {
+		return fmt.Errorf("unmarshal genesis: %v", err)
+	}
+
+	env := environment.New()
+	defer func() {
+		if err := env.Close(); err != nil {
+			ctx.Logger.Error("Monomer", "err", fmt.Errorf("close: %v", err))
+		}
+	}()
+	ctxMonomer, cancelMonomer := context.WithCancel(context.Background())
+	defer cancelMonomer()
+	var monomerCometWSURL *e2eurl.URL
 	if gRPCOnly {
 		ctx.Logger.Info("starting node in gRPC only mode; Tendermint is disabled")
 		config.GRPC.Enable = true
 	} else {
 		ctx.Logger.Info("starting node with ABCI Tendermint in-process")
 
-		tmNode, err = node.NewNode(
-			cfg,
-			pvm.LoadOrGenFilePV(cfg.PrivValidatorKeyFile(), cfg.PrivValidatorStateFile()),
-			nodeKey,
-			proxy.NewLocalClientCreator(app),
-			genDocProvider,
-			node.DefaultDBProvider,
-			node.DefaultMetricsProvider(cfg.Instrumentation),
-			ctx.Logger,
-		)
+		// TODO is this the best way to set the variables? Is there place where we need to define flags?
+
+		engineHTTP, err := net.Listen("tcp", ctx.Viper.GetString("monomer.engine-http"))
 		if err != nil {
-			return err
+			return fmt.Errorf("create engine http listener: %v", err)
+		}
+		engineWS, err := net.Listen("tcp", ctx.Viper.GetString("monomer.engine-ws"))
+		if err != nil {
+			return fmt.Errorf("create engine websocket listener: %v", err)
+		}
+		cometListener, err := net.Listen("tcp", ctx.Viper.GetString("monomer.comet"))
+		if err != nil {
+			return fmt.Errorf("create comet listener: %v", err)
 		}
 
-		if err := tmNode.Start(); err != nil {
-			return err
+		monomerDBPath := ctx.Viper.GetString("monomer.db")
+		blockdb, err := dbm.NewDB("blockdb", dbm.GoLevelDBBackend, monomerDBPath)
+		if err != nil {
+			return fmt.Errorf("open block db: %v", err)
+		}
+		env.DeferErr("close block db", blockdb.Close)
+		txdb, err := dbm.NewDB("txdb", dbm.GoLevelDBBackend, monomerDBPath)
+		if err != nil {
+			return fmt.Errorf("open tx db: %v", err)
+		}
+		env.DeferErr("close tx db", txdb.Close)
+		mempooldb, err := dbm.NewDB("mempooldb", dbm.GoLevelDBBackend, monomerDBPath)
+		if err != nil {
+			return fmt.Errorf("open mempool db: %v", err)
+		}
+		env.DeferErr("close mempool db", mempooldb.Close)
+
+		tmNode = node.New(
+			&monomerApp{
+				Application: app,
+				cms:         store.NewCommitMultiStore(db), // We happen to know that the app accesses the db through the CommitMultiStore.
+			},
+			nodeGenesis,
+			engineHTTP,
+			engineWS,
+			cometListener,
+			blockdb,
+			txdb,
+			mempooldb,
+			rolluptypes.AdaptCosmosTxsToEthTxs,
+			rolluptypes.AdaptPayloadTxsToCosmosTxs,
+			&node.SelectiveListener{
+				OnEngineHTTPServeErrCb: func(err error) {
+					ctx.Logger.Error("Monomer engine HTTP server", "err", err)
+				},
+				OnEngineWebsocketServeErrCb: func(err error) {
+					ctx.Logger.Error("Monomer engine Websocket server", "err", err)
+				},
+				OnCometServeErrCb: func(err error) {
+					ctx.Logger.Error("Monomer comet server", "err", err)
+				},
+			},
+		)
+
+		if err := tmNode.Run(ctxMonomer, env); err != nil {
+			return fmt.Errorf("run monomer: %v", err)
+		}
+		cometStdURL, err := url.Parse("ws://"+cometListener.Addr().String()+"/websocket")
+		if err != nil {
+			return fmt.Errorf("parse std comet url: %v", err)
+		}
+		monomerCometWSURL, err = e2eurl.Parse(cometStdURL)
+		if err != nil {
+			return fmt.Errorf("parse comet url: %v", err)
+		}
+		if !monomerCometWSURL.IsReachable(context.Background()) {
+			return nil
 		}
 	}
 
@@ -342,7 +427,11 @@ func startInProcess(ctx *Context, clientCtx client.Context, appCreator types.App
 	if (config.API.Enable || config.GRPC.Enable) && tmNode != nil {
 		// re-assign for making the client available below
 		// do not use := to avoid shadowing clientCtx
-		clientCtx = clientCtx.WithClient(local.New(tmNode))
+		monomerRPCClient, err := rpc.Dial(monomerCometWSURL.String())
+		if err != nil {
+			return fmt.Errorf("dial monomer's comet endpoint: %v", err)
+		}
+		clientCtx = clientCtx.WithClient(NewMonomerClient(monomerRPCClient))
 
 		app.RegisterTxService(clientCtx)
 		app.RegisterTendermintService(clientCtx)
@@ -356,12 +445,7 @@ func startInProcess(ctx *Context, clientCtx client.Context, appCreator types.App
 
 	var apiSrv *api.Server
 	if config.API.Enable {
-		genDoc, err := genDocProvider()
-		if err != nil {
-			return err
-		}
-
-		clientCtx := clientCtx.WithHomeDir(home).WithChainID(genDoc.ChainID)
+		clientCtx := clientCtx.WithHomeDir(home).WithChainID(nodeGenesis.ChainID.String())
 
 		if config.GRPC.Enable {
 			_, port, err := net.SplitHostPort(config.GRPC.Address)
@@ -503,8 +587,7 @@ func startInProcess(ctx *Context, clientCtx client.Context, appCreator types.App
 	}
 
 	defer func() {
-		if tmNode != nil && tmNode.IsRunning() {
-			_ = tmNode.Stop()
+		if tmNode != nil {
 			_ = app.Close()
 		}
 
